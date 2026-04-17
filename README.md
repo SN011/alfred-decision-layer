@@ -2,25 +2,29 @@
 
 A prototype decision engine that determines how an AI text-message assistant should handle a proposed action: **execute silently**, **execute and notify**, **confirm before executing**, **ask a clarifying question**, or **refuse / escalate**.
 
-Built with an **Agno Team of Agents** (Risk Assessor + Conversation Analyst + Decision Leader), persistent memory, and xAI `grok-4-1-fast-reasoning`.
+The system is implemented as a multi-agent team built on the [Agno](https://docs.agno.com/) framework, backed by persistent memory and running `xai/grok-4-1-fast-reasoning` as the reasoning model.
 
 - **Live URL:** https://alfred-decision-layer.onrender.com *(update after deploy)*
 - **Repo:** https://github.com/SN011/alfred-decision-layer
 
 ---
 
-## Why this design
+## Problem framing
 
-The challenge frames this as a **contextual conversation decision problem, not one-shot classification**. The canonical failure case is:
+The challenge specification makes an important distinction: this is *a contextual conversation decision problem, not a one-shot prompt classification task*. The canonical failure case:
 
-> User asks alfred_ to draft a pricing email to Acme → alfred_ drafts it → user says "hold off until legal reviews pricing language" → minutes later, user says "Yep, send it."
+> The user asks alfred_ to draft an external pricing email. alfred_ drafts it. The user says *"hold off until legal reviews the pricing language."* Several minutes later, the user says *"Yep, send it."*
 
-A one-shot classifier reads "Yep, send it" and fires. A good decision layer recognizes the pending legal condition was never resolved.
+A one-shot classifier reads the final message in isolation, scores it as high-confidence confirmation, and sends the email. A robust decision layer must recognize that the legal-review condition was never explicitly satisfied and, therefore, treat the confirmation as ambiguous.
 
-So the system is built around two things the challenge explicitly cares about:
+Two design commitments follow from this framing:
 
-1. **Context over the latest message** — conversation history is a first-class input, not a retrieval afterthought.
-2. **Judgment, not rules** — no regex, no keyword matching, no hand-coded risk scores. The reasoning is LLM-native.
+1. **Conversation history is a first-class input.** Every decision must consider accumulated context, not only the latest turn.
+2. **Judgment is delegated to reasoning, not encoded as rules.** Hand-authored heuristics (keyword matches, regex patterns, fixed risk scores) do not generalize across the space of natural-language directives the user might issue.
+
+Both commitments have direct implications for the architecture.
+
+---
 
 ## Architecture
 
@@ -40,138 +44,204 @@ So the system is built around two things the challenge explicitly cares about:
              │  scope, sensitivity   │  │ ambiguous references  │
              └───────────────────────┘  └───────────────────────┘
 
-        Shared context: alfred_'s capabilities (what actions it can take
-        and what their real-world effects are — sending emails is
-        irreversible, reminders aren't, etc.)
+        Shared context: alfred_'s action capabilities and their
+        real-world effects (what is reversible, what affects third
+        parties, what is purely informational).
 
-        Memory: SqliteDb with user_memories + agentic_memory +
-        add_history_to_context. The team learns user patterns over time.
+        Persistent state: SqliteDb with user_memories + agentic_memory
+        + add_history_to_context=True. The team accumulates user-
+        specific context across sessions.
 ```
 
-## What signals the system uses, and why
+Two analyst agents examine orthogonal dimensions of the problem; a leader agent synthesizes their findings and produces a structured decision. This separation allows each analyst to be optimized against a narrow, well-defined responsibility.
 
-All signals come from the LLM reasoning over the context. No regex, no keyword matching. Each agent is prompted to look for specific dimensions:
+---
 
-**Risk Assessor considers:**
-- **Reversibility** — can the action be undone? (Emails can't be unsent. Reminders can be deleted.)
-- **External reach** — does it touch people outside the user?
-- **Scope** — one item vs. bulk operations ("this email" vs. "all emails from last 6 months")
-- **Content sensitivity** — confidential data, pricing, legal language
-- **Missing parameters** — what's needed to execute but not in the request?
+## Framework selection: why Agno
 
-Output: a risk paragraph ending with `LOW / MEDIUM / HIGH / CRITICAL`.
+Agno was selected over the other production agentic-AI frameworks (LangGraph, CrewAI, AutoGen, PydanticAI). The rationale is based on three criteria that matter for this specific problem:
 
-**Conversation Analyst considers:**
-- **Contradictions** — "hold off" followed by "do it"
-- **Unresolved conditions** — "wait until legal reviews" — was that confirmed?
-- **Ambiguous references** — "cancel my meeting" when there are three
-- **Intent shifts** — "actually..." / "instead..."
+### 1. First-class multi-agent **Team** primitive
+The decision layer is a classic delegate-and-synthesize pattern. Agno's `Team` is a native construct that supports member agents, delegation, shared memory, and a structured synthesis step. LangGraph can express this as a state machine over a graph, but imposes substantial boilerplate for what is conceptually a simple hierarchy. CrewAI offers role-based crews but biases toward linear task sequences rather than fan-out/synthesis. AutoGen models agents as message-passing actors, which requires implementing coordination semantics manually.
 
-Output: an analysis paragraph ending with `CLEAR INTENT / AMBIGUOUS INTENT / CONFLICTING SIGNALS`.
+### 2. Built-in persistent memory with semantic recall
+The product requirement explicitly includes *user state* as input to decisions. Agno provides three memory modes out of the box:
+- `add_history_to_context` — chat history injected into each prompt
+- `enable_user_memories` — extraction and storage of durable user facts
+- `enable_agentic_memory` — agent-directed memory updates
 
-**Decision Leader** reads both findings plus the full conversation, then returns structured JSON.
+All three are backed by a single `SqliteDb` with no additional integration work. LangGraph requires checkpointers + separate retrieval logic; CrewAI's persistence is limited; AutoGen's memory is less transparent.
 
-## Code vs LLM split
+### 3. Performance characteristics
+Published benchmarks (Agno documentation, October 2025, Apple M4 MacBook Pro, 1000-iteration `tracemalloc` methodology):
 
-### What the LLM decides (everything judgment-shaped)
-- Whether the action is reversible, external, sensitive
-- Whether the conversation has conflicting or unresolved signals
-- The final decision (`execute_silent` / `execute_notify` / `confirm` / `clarify` / `refuse`)
-- Confidence
-- The rationale and user-facing message
+| Metric | Agno | LangGraph | PydanticAI | CrewAI |
+|---|---|---|---|---|
+| Agent instantiation | **3 μs** | 1,587 μs (≈529×) | 170 μs (≈57×) | 210 μs (≈70×) |
+| Per-agent memory | **6.6 KiB** | 161 KiB (≈24×) | 29 KiB (≈4×) | 66 KiB (≈10×) |
 
-### What code does (plumbing only)
-- Format the incoming message and route to the team
-- Parse the leader's JSON output
-- Handle failures (timeout, malformed output, missing context) with a safe fallback
-- Persist conversation + memory via Agno's `SqliteDb`
-- Serve the API + UI
+Low instantiation overhead matters for this use case because the decision layer sits on the hot path of every user message — latency directly impacts UX.
 
-### Why this split
-An earlier draft computed deterministic "signals" — keyword matches, regex for scope, hardcoded reversibility scores. It mis-classified "call the dentist" as a bulk operation because "c**all**" contains "all". The LLM doesn't make that mistake. The model understands context; code doesn't. So code's job is formatting, parsing, persistence, and safe fallback — nothing more.
+### Trade-offs
+
+Agno is not the right choice for every agent system. Its weaknesses relative to the alternatives:
+
+- **LangGraph** offers superior observability, explicit state-machine semantics, and better tooling for long-running stateful workflows. For a workflow with conditional branches, loops, or human-in-the-loop checkpoints across minutes or hours, LangGraph is the stronger choice.
+- **CrewAI** has a gentler learning curve and a richer ecosystem of pre-built role templates for business-process agents. For rapid prototyping of marketing, research, or content workflows, CrewAI accelerates time-to-working-prototype.
+- **AutoGen** is best for agents that primarily communicate through natural-language conversation loops, including code-generating agents.
+
+For the alfred_ decision layer specifically — a single synchronous request, a small fixed team, a latency-sensitive hot path, and strong memory requirements — Agno is the best fit.
+
+---
+
+## Signals the system considers
+
+All signals are derived by LLM reasoning over the input context. The code contains no keyword matching, no regex over user text, no hardcoded risk tables. The agents are prompted to analyze specific dimensions.
+
+**Risk Assessor examines:**
+- **Reversibility** — can the action be undone if it turns out to be wrong? Sending an email is irreversible; setting a reminder is fully reversible.
+- **External reach** — does the action touch parties outside the user's account? Emails, calendar invites, and forwarded content do. Reminders and searches do not.
+- **Scope** — is the action addressing a single item or a bulk operation? *"Delete this email"* and *"Delete all emails from the last 6 months"* have different risk profiles.
+- **Content sensitivity** — does the payload contain confidential, regulated, or legally sensitive material (internal pricing, compensation, acquisition details, etc.)?
+- **Missing parameters** — is critical information absent from the request (recipient, time, subject, body)?
+
+Output format: a paragraph ending with an explicit risk tier — `LOW / MEDIUM / HIGH / CRITICAL`.
+
+**Conversation Analyst examines:**
+- **Contradictions** — direct reversals across turns (*"hold off"* followed by *"do it"*).
+- **Unresolved conditions** — predicates that the user attached to prior directives and did not explicitly release (*"wait until legal reviews the pricing"*).
+- **Ambiguous references** — definite references (*"my meeting"*, *"that email"*) that resolve to multiple candidates.
+- **Intent shifts** — lexical markers of change-of-mind (*"actually..."*, *"instead..."*).
+
+Output format: a paragraph ending with an explicit intent assessment — `CLEAR INTENT / AMBIGUOUS INTENT / CONFLICTING SIGNALS`.
+
+**Decision Leader** reads both analyst outputs alongside the full conversation history and produces a structured decision.
+
+---
+
+## Division of responsibility: model versus code
+
+### Delegated to the LLM
+- Determining whether an action is reversible, external-facing, or sensitive
+- Identifying contradictions and unresolved conditions in the conversation
+- Selecting one of the five decision categories
+- Producing confidence, rationale, and the user-facing message
+
+### Handled by code
+- Routing an incoming message to the team
+- Parsing the leader's structured JSON output
+- Catching execution failures (timeout, malformed output) and returning a safe fallback
+- Persisting conversation state and memories via `SqliteDb`
+- Serving the API and static frontend
+
+### Rationale
+An earlier iteration of this system computed risk signals deterministically — keyword lists, regex-based scope detection, hardcoded reversibility scores. It exhibited the pathological failure mode typical of such systems: the substring-matching scope detector classified *"call the dentist"* as a bulk operation because the word *call* contains the string *all*. No amount of additional regex hygiene recovers a system whose foundation is pattern matching over natural language.
+
+Language models are built to handle this class of reasoning. The engineering effort is better spent on the parts of the pipeline that are mechanical — formatting, parsing, error handling, persistence — and on carefully scoping the prompts rather than hand-authoring heuristics.
+
+---
 
 ## Prompt design
 
-Each agent gets focused instructions with four pieces:
-1. **Role** — what they own ("evaluate risk" vs "analyze the conversation")
-2. **Shared capabilities context** — what alfred_ can do, what's reversible, what has external impact
-3. **What to look for** — specific dimensions to analyze
-4. **What NOT to do** — don't make the final decision, just analyze
+Each member agent is given a tightly scoped prompt with four sections:
+1. **Role** — what this agent is responsible for (*risk assessment* vs. *conversation analysis*)
+2. **Capabilities context** — a shared block describing alfred_'s action space and the real-world effects of each action type (reversibility, external impact)
+3. **Directed analysis** — explicit dimensions to examine
+4. **Boundaries** — an instruction not to make the final decision, which is the leader's job
 
-The Leader gets the full five-option decision framework, explicit boundaries (clarify when intent unresolved; confirm when intent resolved but risky; refuse when policy-violating), a default-safe principle ("when uncertain, escalate"), and the structured output format. See `decision_team.py`.
+The Decision Leader's prompt contains:
+1. The full five-option decision framework with definitions and examples
+2. Decision boundaries: *clarify* when intent is unresolved; *confirm* when intent is resolved but risk exceeds the silent-execution threshold; *refuse* when policy prohibits the action regardless of confirmation
+3. A default-safe principle: when uncertain, escalate up the decision hierarchy (prefer *confirm* over *execute*, prefer *refuse* over *confirm* under severe risk)
+4. A strict JSON output schema
 
-**The exact prompt the model receives is visible in the UI** on every decision — system message, history, memories, user input. Click "Exact Prompt Sent to Model" under any decision.
+The full leader prompt is inspectable in the UI under "Team Config". The exact prompt sent to the model on any individual decision — including system instructions, injected memories, conversation history, and the user message — is visible per-turn under "Exact Prompt Sent to Model".
 
-## Failure handling
-
-| Failure | Detected by | Safe default |
-|---|---|---|
-| **LLM timeout** | Exception → `get_fallback_decision` | `confirm` — never silently execute |
-| **Malformed output** | `JSONDecodeError` in parser | `confirm` — never silently execute |
-| **Missing critical context** | Natural LLM response (e.g. "do the thing") | `clarify` — ask the user |
-
-**The principle:** no failure path results in silent execution of an irreversible action. Every failure either asks the user or escalates.
-
-All three failure paths are wired to buttons in the UI so they're demonstrable in one click.
+---
 
 ## Memory
 
-Uses Agno's `SqliteDb` with:
-- `add_history_to_context=True` + `num_history_runs=5` — the last 5 turns come along in every prompt
-- `enable_user_memories=True` — the team extracts and stores facts about the user
-- `enable_agentic_memory=True` — the team can decide when to update memories based on the run
+The team is configured with Agno's full memory stack:
+- `add_history_to_context=True`, `num_history_runs=5` — the last five turns are injected into each prompt, providing conversational continuity.
+- `enable_user_memories=True` — the team extracts and stores durable facts about the user across sessions.
+- `enable_agentic_memory=True` — the team itself can decide when to create or update memories, rather than relying on a fixed extraction schedule.
 
-Over time, the team learns patterns like "this user always wants external emails confirmed" and adjusts. The UI has a live **Memories** panel so you can see memories appear as you chat.
+The UI exposes the current memory contents in a live panel so the accumulation of user-specific state is observable. Over time, this enables the system to learn patterns such as *"this user consistently approves internal calendar changes silently"* and adjust its threshold accordingly.
 
-## Scenarios (8 preloaded)
+---
 
-| # | Name | Difficulty | Expected |
-|---|---|---|---|
-| 1 | Set a reminder | easy | execute_silent |
-| 2 | Check tomorrow's calendar | easy | execute_silent |
-| 3 | Quick reply to teammate | easy | execute_notify |
-| 4 | Cancel which meeting? | ambiguous | clarify |
-| 5 | Reschedule with external client | ambiguous | confirm |
-| 6 | Send after "hold off" (the canonical example) | ambiguous | confirm |
-| 7 | Delete 6 months of emails | risky | refuse |
-| 8 | Forward board notes to press | risky | refuse |
+## Failure handling
 
-Scenario 6 is the one from the challenge doc. The Conversation Analyst should catch that "hold off until legal reviews" is an unresolved condition — "Yep, send it" doesn't confirm legal finished reviewing.
+| Failure mode | Detection point | Safe default |
+|---|---|---|
+| **LLM timeout** | Exception caught at the `team.run()` call site | `confirm` — never silent-execute |
+| **Malformed model output** | `json.JSONDecodeError` raised during output parsing | `confirm` — never silent-execute |
+| **Missing critical context** | Detected by the team itself (not a code-level failure) | `clarify` — the team asks the user |
 
-## How this evolves as alfred_ gains riskier tools
+**Design principle:** no failure path results in silent execution of an irreversible action. Code-level failures (timeout, malformed output) trigger a structured fallback that defaults to `confirm`. Model-level failures — cases where the user's intent cannot be resolved from the input — are handled by the team's own reasoning, which produces a `clarify` decision naturally.
 
-- **More agents, not more rules.** Add a Policy Enforcer (GDPR, HIPAA, org policy) and a Trust Scorer that adjusts thresholds based on each user's correction history. The team pattern scales; a rule engine doesn't.
-- **Action-specific sub-teams.** Financial transactions, bulk data operations, external communications get routed to specialist sub-teams with extra scrutiny and their own risk models.
-- **Standing permissions.** "Always approve internal calendar moves" — user-granted blanket trust, reducing unnecessary confirmation friction.
-- **Risk-adjusted latency budgets.** Calendar checks should be instant; sending an external email can afford 2 seconds of deliberation.
+All three failure paths are demonstrable in the UI through dedicated buttons. Each is rendered as a diagnostic card showing the simulated input, the detection point, the raw output (where applicable), the code path taken, the final decision (flagged as either *fallback* or *team-handled*), and the governing safety principle.
 
-## What I'd build next (6-month roadmap if I owned this)
+---
 
-**Month 1–2 — Foundation**
-- User feedback loop: in-UI "you didn't need to ask" / "you should have asked" signals that feed back into per-user calibration
-- Full audit log of every decision with the exact prompt, analyst outputs, and final decision (for trust and debugging)
-- Latency budgets per action type
+## Scenario coverage
 
-**Month 3–4 — Learning**
-- Anomaly detection on action patterns (user who never sends bulk emails suddenly does → escalate)
-- Multi-step action chains evaluated together, not turn-by-turn
-- A/B framework for decision thresholds
-- Organization-level policy engine
+Eight scenarios are preloaded to exercise the decision surface:
 
-**Month 5–6 — Scale**
-- Fine-tuned decision model on real user feedback — faster, cheaper, more reliable than a general LLM for this task
-- Compliance integration (GDPR, HIPAA) injected as team context
-- Real-time risk dashboard for alfred_ operators
-- Delegation protocols with standing permissions
+| # | Name | Difficulty | Expected decision | Rationale |
+|---|---|---|---|---|
+| 1 | Set a reminder | easy | `execute_silent` | Fully reversible, no external impact, clear intent |
+| 2 | Check tomorrow's calendar | easy | `execute_silent` | Read-only, zero side effects |
+| 3 | Quick reply to teammate | easy | `execute_notify` | Low-risk internal action; user should be informed |
+| 4 | Cancel which meeting? | ambiguous | `clarify` | Multiple candidate entities; reference unresolved |
+| 5 | Reschedule with external client | ambiguous | `confirm` | Affects a third-party calendar |
+| 6 | Send after *"hold off"* (challenge canonical) | ambiguous | `confirm` | Unresolved pre-condition in conversation history |
+| 7 | Delete 6 months of emails | risky | `refuse` | Irreversible bulk destruction |
+| 8 | Forward board notes to press | risky | `refuse` | Confidential data to external journalist; policy violation |
 
-## What I chose not to build
+Scenario 6 is the canonical example from the challenge specification. The Conversation Analyst should identify that *"hold off until legal reviews the pricing language"* introduced a pending condition and that the subsequent *"Yep, send it"* does not reference or discharge that condition.
 
-- **Real action execution.** The prototype decides but doesn't actually send emails or edit calendars. The decision layer is the product.
-- **Streaming.** Request/response is fine at this stage; streaming is a polish item.
-- **Per-user auth.** Everyone is `demo_user`. Production would personalize and scope memory per-user.
-- **Fine-tuned model.** Prompt-engineered general LLM is faster to build; a fine-tune is a later optimization.
+---
 
-## Running locally
+## Evolution as alfred_ gains higher-risk capabilities
+
+- **Specialized agents, not additional heuristics.** A Policy Enforcer agent can encode organizational and regulatory constraints (GDPR, HIPAA, internal compliance). A Trust Scorer can adjust per-user thresholds based on the user's correction history. The multi-agent team pattern composes cleanly as new concerns are added; a rule engine does not.
+- **Action-specific sub-teams.** High-consequence actions (financial transactions, bulk data operations, external communication at scale) should be routed to specialist sub-teams with their own risk models and additional scrutiny.
+- **Standing permissions.** Users can grant alfred_ pre-approved blanket permission for specific action patterns, reducing confirmation friction on routine low-risk operations while preserving the confirmation step for the rest.
+- **Risk-adjusted latency budgets.** Informational actions (calendar checks, email search) should execute within a few hundred milliseconds. High-risk actions can tolerate two to three seconds of deliberation and multi-agent review.
+
+## Roadmap for the next six months
+
+**Months 1–2: Foundation**
+- Feedback loop: in-UI signals for *"you did not need to ask"* and *"you should have asked"*, captured per-user and used for threshold calibration.
+- Structured audit log of every decision (full prompt, analyst outputs, final decision, timing), for trust, debugging, and post-hoc analysis.
+- Per-action-type latency budgets with alerting when exceeded.
+
+**Months 3–4: Learning**
+- Anomaly detection on action patterns at the per-user level (e.g., a user who never sends bulk email suddenly requests a bulk send).
+- Compound-action evaluation: multi-step chains of dependent actions evaluated as a unit rather than turn-by-turn.
+- A/B framework for decision threshold experimentation.
+- Organization-level policy engine with versioned rule sets.
+
+**Months 5–6: Scale**
+- Fine-tuned decision model trained on accumulated user-feedback signals — expected improvements in latency, cost, and consistency over a general-purpose LLM.
+- Compliance integration: GDPR, HIPAA, and organization-specific policies injected as team context.
+- Real-time risk dashboard for alfred_ operators (decisions per second, confirm/refuse rates, latency distributions).
+- Delegation protocols supporting standing permissions and revocation.
+
+---
+
+## Scope decisions
+
+Intentionally out of scope for this prototype:
+- **Action execution.** The system produces decisions but does not actually send emails, modify calendars, or set reminders. The decision layer is the unit under evaluation.
+- **Streaming responses.** The protocol is synchronous request/response. Streaming is a user-experience optimization, not a correctness concern for the decision layer.
+- **Per-user authentication and isolation.** All sessions use a single demo user identifier. A production system would scope sessions and memory per authenticated user.
+- **Fine-tuned model.** The prototype uses a general-purpose frontier model with prompt engineering. A fine-tuned decision model is expected to improve both latency and consistency but is a later optimization.
+
+---
+
+## Local development
 
 ```bash
 git clone https://github.com/SN011/alfred-decision-layer
@@ -180,28 +250,21 @@ cd alfred-decision-layer
 pip install -r requirements.txt
 
 cp .env.example .env
-# Edit .env and add ONE of: XAI_API_KEY, OPENAI_API_KEY, or GROQ_API_KEY
+# Add one of: XAI_API_KEY, OPENAI_API_KEY, or GROQ_API_KEY
 
 python server.py
-# → http://localhost:8080
+# Served at http://localhost:8080
 ```
 
-## Deploy to Render (one-click)
+## Deployment
 
-This repo includes a `render.yaml`. On [render.com](https://render.com):
+The repository includes a `render.yaml` Blueprint for one-click deployment to [Render](https://render.com). See [RENDER_DEPLOY.md](./RENDER_DEPLOY.md) for step-by-step instructions. A `Dockerfile` is provided for deployment to other container platforms.
 
-1. New → Blueprint → connect this repo
-2. Render reads `render.yaml` and creates the web service
-3. Set the `XAI_API_KEY` (or OpenAI / Groq) env var in the Render dashboard
-4. Deploy
+## Technical stack
 
-See [RENDER_DEPLOY.md](./RENDER_DEPLOY.md) for the step-by-step.
-
-## Tech stack
-
-- **Agents:** Agno Team of Agents
-- **Backend:** FastAPI
-- **LLM:** xAI `grok-4-1-fast-reasoning` (falls back to OpenAI or Groq if xAI key not set)
-- **Memory:** Agno `SqliteDb` (user memories + agentic memory + chat history)
-- **Frontend:** Vanilla HTML + Tailwind (no build step)
-- **Deploy:** Render (Docker optional)
+- **Agent framework:** Agno 2.3.x (Teams + SqliteDb)
+- **Reasoning model:** xAI `grok-4-1-fast-reasoning` (with OpenAI and Groq as configured fallbacks)
+- **API:** FastAPI
+- **Memory:** Agno `SqliteDb` (user memories, agentic memory, chat history)
+- **Frontend:** Vanilla HTML + Tailwind CSS (no build step)
+- **Deployment:** Render (Python runtime) or any Docker-compatible platform
