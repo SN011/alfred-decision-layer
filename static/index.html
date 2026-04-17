@@ -1,0 +1,424 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>alfred_ — Execution Decision Layer</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=DM+Sans:wght@400;500;600;700&display=swap');
+    body { font-family: 'DM Sans', sans-serif; background: #0c0c14; color: #e2e8f0; }
+    code, pre, .mono { font-family: 'JetBrains Mono', monospace; }
+    .card { background: #12121e; border: 1px solid #1e293b; border-radius: 8px; }
+    .badge { display: inline-flex; align-items: center; padding: 2px 10px; border-radius: 9999px; font-size: 0.7rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; }
+    .b-silent { background: #064e3b; color: #6ee7b7; }
+    .b-notify { background: #1e3a5f; color: #7dd3fc; }
+    .b-confirm { background: #713f12; color: #fde68a; }
+    .b-clarify { background: #3b0764; color: #d8b4fe; }
+    .b-refuse { background: #7f1d1d; color: #fca5a5; }
+    .b-unknown { background: #334155; color: #94a3b8; }
+    .b-easy { background: #064e3b; color: #6ee7b7; }
+    .b-ambiguous { background: #713f12; color: #fde68a; }
+    .b-risky { background: #7f1d1d; color: #fca5a5; }
+    .msg-user { background: #1e1b4b; border: 1px solid #312e81; }
+    .msg-alfred { background: #12121e; border: 1px solid #1e293b; }
+    .scenario-btn { transition: all 0.15s; cursor: pointer; }
+    .scenario-btn:hover { border-color: #6366f1; transform: translateY(-1px); }
+    .scenario-btn.running { opacity: 0.5; pointer-events: none; }
+    details summary { cursor: pointer; list-style: none; }
+    details summary::-webkit-details-marker { display: none; }
+    details summary::before { content: '▸ '; color: #6366f1; }
+    details[open] summary::before { content: '▾ '; }
+    #chat-input:focus { outline: none; border-color: #6366f1; }
+    .agent-pill { border-left: 3px solid #6366f1; background: #0f0f1a; }
+    .typing { animation: blink 1s infinite; }
+    @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.3} }
+    .side-panel { scrollbar-width: thin; scrollbar-color: #1e293b transparent; }
+    .memory-item { border-left: 2px solid #22d3ee; }
+    .history-user { border-left: 2px solid #818cf8; }
+    .history-alfred { border-left: 2px solid #6366f1; }
+    .panel-tab { transition: all 0.15s; }
+    .panel-tab.active { color: #e2e8f0; border-bottom: 2px solid #6366f1; }
+  </style>
+</head>
+<body class="min-h-screen">
+
+<!-- Main 3-column layout -->
+<div class="flex h-screen">
+
+  <!-- LEFT: Chat -->
+  <div class="flex-1 flex flex-col min-w-0 border-r border-slate-800">
+
+    <!-- Header -->
+    <header class="px-4 py-4 border-b border-slate-800">
+      <div class="flex items-baseline gap-3 mb-1">
+        <h1 class="text-2xl font-bold tracking-tight">alfred_</h1>
+        <span class="text-xs text-slate-500 mono">execution decision layer</span>
+      </div>
+      <div id="status" class="text-xs mono text-slate-600"></div>
+    </header>
+
+    <!-- Scenarios bar -->
+    <div class="px-4 py-3 border-b border-slate-800 bg-[#0a0a12]">
+      <div class="flex items-center gap-2 mb-2">
+        <span class="text-xs font-semibold text-slate-500 uppercase tracking-wider">Scenarios</span>
+        <button onclick="showTeamConfig()" class="text-xs text-indigo-400 hover:text-indigo-300 mono ml-auto">team config</button>
+      </div>
+      <div id="scenarios" class="flex flex-wrap gap-2"></div>
+      <div class="flex gap-2 mt-2">
+        <span class="text-xs text-slate-600 self-center">Failures:</span>
+        <button onclick="runFailure('timeout')" class="text-xs px-2 py-0.5 rounded border border-slate-700 hover:border-red-500/50 text-slate-500 mono">timeout</button>
+        <button onclick="runFailure('malformed')" class="text-xs px-2 py-0.5 rounded border border-slate-700 hover:border-red-500/50 text-slate-500 mono">malformed</button>
+        <button onclick="runFailure('missing_context')" class="text-xs px-2 py-0.5 rounded border border-slate-700 hover:border-red-500/50 text-slate-500 mono">missing ctx</button>
+      </div>
+    </div>
+
+    <!-- Chat messages -->
+    <div id="chat" class="flex-1 overflow-y-auto space-y-3 p-4">
+      <div class="text-center text-sm text-slate-600 py-8">
+        Pick a scenario or start typing. Agno memory handles history.
+      </div>
+    </div>
+
+    <!-- Input -->
+    <div class="px-4 py-3 border-t border-slate-800 flex gap-2">
+      <input id="chat-input" type="text" placeholder="Tell alfred_ what to do..."
+             class="flex-1 px-4 py-3 rounded-lg bg-[#1a1a2e] border border-slate-700 text-sm"
+             onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendMessage();}">
+      <button onclick="sendMessage()" id="send-btn"
+              class="px-5 py-3 bg-indigo-600 hover:bg-indigo-500 rounded-lg text-sm font-semibold transition">Send</button>
+      <button onclick="newSession()" class="px-3 py-3 rounded-lg border border-slate-700 text-xs text-slate-500 hover:text-slate-300 mono" title="New session">new</button>
+    </div>
+  </div>
+
+  <!-- RIGHT: Side panels -->
+  <div class="w-80 flex flex-col bg-[#0a0a12] hidden lg:flex">
+
+    <!-- Panel tabs -->
+    <div class="flex border-b border-slate-800">
+      <button onclick="switchPanel('memories')" id="tab-memories" class="panel-tab active flex-1 px-3 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wider text-center">
+        Memories
+      </button>
+      <button onclick="switchPanel('history')" id="tab-history" class="panel-tab flex-1 px-3 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wider text-center">
+        History
+      </button>
+    </div>
+
+    <!-- Memories panel -->
+    <div id="panel-memories" class="flex-1 overflow-y-auto side-panel p-3">
+      <div class="text-xs text-slate-600 mb-3">
+        Agno stores user memories across sessions. These persist and influence future decisions.
+      </div>
+      <div id="memories-list">
+        <div class="text-xs text-slate-600 italic">No memories yet. Chat to build them up.</div>
+      </div>
+      <button onclick="refreshMemories()" class="mt-3 text-xs text-indigo-400 hover:text-indigo-300 mono">refresh</button>
+    </div>
+
+    <!-- History panel -->
+    <div id="panel-history" class="flex-1 overflow-y-auto side-panel p-3 hidden">
+      <div class="text-xs text-slate-600 mb-3">
+        Agno's stored conversation history for this session (from the DB, not the UI).
+      </div>
+      <div id="history-list">
+        <div class="text-xs text-slate-600 italic">No history yet.</div>
+      </div>
+      <button onclick="refreshHistory()" class="mt-3 text-xs text-indigo-400 hover:text-indigo-300 mono">refresh</button>
+    </div>
+
+    <!-- Session info -->
+    <div class="px-3 py-2 border-t border-slate-800 text-xs mono text-slate-700">
+      session: <span id="session-display" class="text-slate-500"></span>
+    </div>
+  </div>
+</div>
+
+<!-- Team Config Modal -->
+<div id="config-modal" class="hidden fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4" onclick="if(event.target===this)this.classList.add('hidden')">
+  <div class="card p-6 max-w-2xl w-full max-h-[80vh] overflow-y-auto">
+    <div class="flex justify-between mb-4">
+      <h2 class="text-sm font-semibold text-slate-400 uppercase tracking-wider">Team Configuration</h2>
+      <button onclick="document.getElementById('config-modal').classList.add('hidden')" class="text-slate-500 text-lg">&times;</button>
+    </div>
+    <div id="config-content"></div>
+  </div>
+</div>
+
+<script>
+const API = '';
+const BCLS = {execute_silent:'b-silent',execute_notify:'b-notify',confirm:'b-confirm',clarify:'b-clarify',refuse:'b-refuse',unknown:'b-unknown'};
+const LABELS = {execute_silent:'Execute Silently',execute_notify:'Execute & Notify',confirm:'Confirm',clarify:'Clarify',refuse:'Refuse / Escalate',unknown:'Unknown'};
+const DCLS = {easy:'b-easy',ambiguous:'b-ambiguous',risky:'b-risky'};
+
+let sessionId = crypto.randomUUID();
+let scenarios = [];
+let sending = false;
+
+function updateSessionDisplay() {
+  document.getElementById('session-display').textContent = sessionId.slice(0,8);
+}
+
+function newSession() {
+  sessionId = crypto.randomUUID();
+  updateSessionDisplay();
+  document.getElementById('chat').innerHTML = '<div class="text-center text-sm text-slate-600 py-8">New session started.</div>';
+  const hl = document.getElementById('history-list');
+  const ml = document.getElementById('memories-list');
+  hl.innerHTML = '<div class="text-xs text-slate-600 italic">No history yet.</div>';
+  delete hl.dataset.hasData;
+  delete ml.dataset.hasData;
+}
+
+function switchPanel(panel) {
+  document.getElementById('panel-memories').classList.toggle('hidden', panel !== 'memories');
+  document.getElementById('panel-history').classList.toggle('hidden', panel !== 'history');
+  document.getElementById('tab-memories').classList.toggle('active', panel === 'memories');
+  document.getElementById('tab-history').classList.toggle('active', panel === 'history');
+  if (panel === 'memories') refreshMemories();
+  if (panel === 'history') refreshHistory();
+}
+
+async function refreshMemories() {
+  try {
+    const list = document.getElementById('memories-list');
+    const res = await fetch(`${API}/api/memories?user_id=demo_user`);
+    const data = await res.json();
+    if (!data.memories || data.memories.length === 0) {
+      if (!list.dataset.hasData) list.innerHTML = '<div class="text-xs text-slate-600 italic">No memories yet. The team learns as you chat.</div>';
+      return;
+    }
+    list.dataset.hasData = '1';
+    list.innerHTML = data.memories.map(m => `
+      <div class="memory-item pl-3 py-2 mb-2 bg-[#12121e] rounded-r">
+        <div class="text-xs text-slate-300">${esc(m.content || '')}</div>
+        ${m.topics && m.topics.length ? `<div class="flex gap-1 mt-1">${m.topics.map(t => `<span class="text-xs mono bg-cyan-900/30 text-cyan-400 px-1.5 py-0.5 rounded">${esc(t)}</span>`).join('')}</div>` : ''}
+        ${m.created_at ? `<div class="text-xs text-slate-700 mono mt-1">${m.created_at}</div>` : ''}
+      </div>
+    `).join('');
+  } catch(e) {
+    document.getElementById('memories-list').innerHTML = `<div class="text-xs text-red-400">${e.message}</div>`;
+  }
+}
+
+async function refreshHistory() {
+  try {
+    const list = document.getElementById('history-list');
+    const res = await fetch(`${API}/api/history?session_id=${sessionId}`);
+    const data = await res.json();
+    if (!data.messages || data.messages.length === 0) {
+      if (!list.dataset.hasData) list.innerHTML = '<div class="text-xs text-slate-600 italic">No history in DB yet. Syncing...</div>';
+      return;
+    }
+    list.dataset.hasData = '1';
+    list.innerHTML = data.messages.map(m => {
+      const isUser = m.role === 'user';
+      return `<div class="${isUser ? 'history-user' : 'history-alfred'} pl-3 py-1.5 mb-1.5 rounded-r">
+        <div class="text-xs ${isUser ? 'text-indigo-400' : 'text-slate-500'} mono">${m.role}</div>
+        <div class="text-xs text-slate-400 leading-relaxed">${esc((m.content || '').slice(0, 300))}${m.content && m.content.length > 300 ? '...' : ''}</div>
+      </div>`;
+    }).join('');
+  } catch(e) {
+    document.getElementById('history-list').innerHTML = `<div class="text-xs text-red-400">${e.message}</div>`;
+  }
+}
+
+async function init() {
+  updateSessionDisplay();
+  try {
+    const h = await fetch(`${API}/health`);
+    const health = await h.json();
+    document.getElementById('status').textContent = `${health.model} | ${health.members.join(' + ')} | memory: on`;
+  } catch(e) {
+    document.getElementById('status').textContent = `Backend: ${e.message}`;
+  }
+  try {
+    const s = await fetch(`${API}/api/scenarios`);
+    const data = await s.json();
+    scenarios = data.scenarios || [];
+    renderScenarios();
+  } catch(e) {
+    document.getElementById('scenarios').innerHTML = `<span class="text-xs text-red-400">Could not load scenarios: ${e.message}</span>`;
+  }
+}
+
+function renderScenarios() {
+  document.getElementById('scenarios').innerHTML = scenarios.map(s => `
+    <button class="scenario-btn card px-3 py-1.5 text-left" id="sc-${s.id}" onclick="playScenario('${s.id}')">
+      <div class="flex items-center gap-1">
+        <span class="badge ${DCLS[s.difficulty]}" style="font-size:0.55rem;padding:1px 6px">${s.difficulty}</span>
+        <span class="text-xs font-semibold">${s.name}</span>
+        <span class="text-xs text-slate-600 mono">${s.turns.length}t</span>
+      </div>
+    </button>
+  `).join('');
+}
+
+function addUserMsg(text) {
+  const empty = document.querySelector('#chat .text-center');
+  if (empty) empty.remove();
+  document.getElementById('chat').insertAdjacentHTML('beforeend',
+    `<div class="msg-user rounded-lg px-4 py-3 ml-12"><div class="text-xs text-indigo-400 mb-1">You</div><div class="text-sm">${esc(text)}</div></div>`);
+  scrollChat();
+}
+
+function addAlfredMsg(data) {
+  const d = data.decision || {};
+  const dec = d.decision || 'unknown';
+  const badge = `<span class="badge ${BCLS[dec] || 'b-unknown'}">${LABELS[dec] || dec}</span>`;
+  const conf = d.confidence != null ? `<span class="text-xs text-slate-500 mono ml-2">${Math.round(d.confidence*100)}%</span>` : '';
+  const lat = data.latency_ms ? `<span class="text-xs text-slate-600 mono ml-auto">${data.latency_ms}ms</span>` : '';
+  const fallback = data.is_fallback ? `<div class="mt-2 px-3 py-2 bg-red-900/30 border border-red-700/50 rounded text-xs text-red-300">${esc(data.error || 'Fallback applied')}</div>` : '';
+  const userMsg = d.user_facing_message ? `<div class="text-sm text-slate-200 mt-2 italic">"${esc(d.user_facing_message)}"</div>` : '';
+  const hood = buildHood(data);
+
+  document.getElementById('chat').insertAdjacentHTML('beforeend', `
+    <div class="msg-alfred rounded-lg px-4 py-3 mr-12">
+      <div class="flex items-center gap-2 mb-2">
+        <span class="text-xs text-slate-500">alfred_</span>
+        ${badge}${conf}${lat}
+      </div>
+      ${fallback}
+      ${d.rationale ? `<div class="text-sm text-slate-400 mt-1">${esc(d.rationale)}</div>` : ''}
+      ${userMsg}
+      ${hood}
+    </div>
+  `);
+  scrollChat();
+}
+
+function buildHood(data) {
+  const d = data.decision || {};
+  let parts = '';
+  if (d.risk_assessment) {
+    parts += `<details class="mt-2"><summary class="text-xs text-slate-500">Risk Assessment</summary>
+      <div class="agent-pill rounded p-2 mt-1 text-xs text-slate-400">${esc(d.risk_assessment)}</div></details>`;
+  }
+  if (d.conversation_analysis) {
+    parts += `<details class="mt-1"><summary class="text-xs text-slate-500">Conversation Analysis</summary>
+      <div class="agent-pill rounded p-2 mt-1 text-xs text-slate-400">${esc(d.conversation_analysis)}</div></details>`;
+  }
+  if (d.key_factors && d.key_factors.length) {
+    parts += `<div class="flex flex-wrap gap-1 mt-2">${d.key_factors.map(f=>`<span class="text-xs mono bg-slate-800 px-2 py-0.5 rounded">${esc(f)}</span>`).join('')}</div>`;
+  }
+  if (data.raw_content) {
+    parts += `<details class="mt-1"><summary class="text-xs text-slate-500">Raw Model Output</summary>
+      <pre class="text-xs mono text-slate-500 bg-[#0c0c14] rounded p-2 mt-1 overflow-x-auto whitespace-pre-wrap max-h-48 overflow-y-auto">${esc(data.raw_content)}</pre></details>`;
+  }
+  return parts;
+}
+
+function addTyping() {
+  document.getElementById('chat').insertAdjacentHTML('beforeend',
+    `<div id="typing" class="msg-alfred rounded-lg px-4 py-3 mr-12"><span class="text-xs text-slate-500 typing">alfred_ is thinking...</span></div>`);
+  scrollChat();
+}
+function removeTyping() { document.getElementById('typing')?.remove(); }
+function scrollChat() { const c = document.getElementById('chat'); c.scrollTop = c.scrollHeight; }
+function esc(s) { if (!s) return ''; const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+
+function afterResponse() {
+  // Agno writes memories/history to DB async after the run completes.
+  // Fire-and-forget polling so it doesn't block scenario playback.
+  (async () => {
+    for (const delay of [500, 2000, 6000]) {
+      await new Promise(r => setTimeout(r, delay));
+      await Promise.all([refreshMemories(), refreshHistory()]);
+    }
+  })();
+}
+
+async function sendMessage() {
+  const input = document.getElementById('chat-input');
+  const msg = input.value.trim();
+  if (!msg || sending) return;
+  input.value = '';
+  sending = true;
+  addUserMsg(msg);
+  addTyping();
+  try {
+    const res = await fetch(`${API}/chat`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ message: msg, session_id: sessionId }),
+    });
+    removeTyping();
+    addAlfredMsg(await res.json());
+  } catch(e) {
+    removeTyping();
+    addAlfredMsg({ decision: { decision: 'unknown', rationale: `Error: ${e.message}` }, is_fallback: true, error: e.message });
+  }
+  sending = false;
+  afterResponse();
+}
+
+async function playScenario(id) {
+  const sc = scenarios.find(s => s.id === id);
+  if (!sc || sending) return;
+  sending = true;
+  document.getElementById(`sc-${id}`).classList.add('running');
+
+  for (const turn of sc.turns) {
+    addUserMsg(turn);
+    addTyping();
+    try {
+      const res = await fetch(`${API}/chat`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ message: turn, session_id: sessionId }),
+      });
+      removeTyping();
+      addAlfredMsg(await res.json());
+    } catch(e) {
+      removeTyping();
+      addAlfredMsg({ decision: { decision: 'unknown', rationale: `Error: ${e.message}` }, is_fallback: true, error: e.message });
+    }
+  }
+  document.getElementById(`sc-${id}`).classList.remove('running');
+  sending = false;
+  afterResponse();
+}
+
+async function runFailure(type) {
+  if (sending) return;
+  addUserMsg(`[Simulating ${type} failure]`);
+  addTyping();
+  try {
+    const res = await fetch(`${API}/api/simulate-failure`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ failure_type: type }),
+    });
+    removeTyping();
+    addAlfredMsg(await res.json());
+  } catch(e) {
+    removeTyping();
+    addAlfredMsg({ decision: { decision: 'unknown', rationale: `Error: ${e.message}` }, is_fallback: true, error: e.message });
+  }
+}
+
+async function showTeamConfig() {
+  try {
+    const res = await fetch(`${API}/api/team-config`);
+    const cfg = await res.json();
+    let html = `<div class="text-xs text-slate-500 mb-2 mono">Model: ${cfg.model}</div>`;
+    html += `<div class="text-xs text-slate-500 mb-1 mono">Memory: user=${cfg.memory.user_memories}, agentic=${cfg.memory.agentic_memory}, history=${cfg.memory.history_runs} runs</div>`;
+    html += `<details open class="mt-3"><summary class="text-xs font-semibold text-slate-400">Leader Instructions</summary>
+      <pre class="text-xs mono text-slate-500 bg-[#0c0c14] rounded p-2 mt-1 whitespace-pre-wrap max-h-60 overflow-y-auto">${esc(cfg.leader_instructions.join('\n'))}</pre></details>`;
+    html += `<details class="mt-2"><summary class="text-xs font-semibold text-slate-400">Capabilities Context</summary>
+      <pre class="text-xs mono text-slate-500 bg-[#0c0c14] rounded p-2 mt-1 whitespace-pre-wrap">${esc(cfg.capabilities)}</pre></details>`;
+    cfg.members.forEach(m => {
+      html += `<div class="agent-pill rounded p-3 mt-2">
+        <div class="text-sm font-semibold text-indigo-400">${m.name}</div>
+        <div class="text-xs text-slate-500 mb-1">${m.role}</div>
+        <pre class="text-xs mono text-slate-600 whitespace-pre-wrap">${esc((m.instructions||[]).join('\n'))}</pre>
+      </div>`;
+    });
+    document.getElementById('config-content').innerHTML = html;
+    document.getElementById('config-modal').classList.remove('hidden');
+  } catch(e) { alert('Error: ' + e.message); }
+}
+
+init();
+</script>
+</body>
+</html>
