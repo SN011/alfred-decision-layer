@@ -48,6 +48,39 @@ db: Optional[SqliteDb] = None
 model_name: str = "none"
 
 
+def extract_prompt(response) -> list:
+    """Pull the exact messages sent to the model. This is THE prompt — system
+    instructions + memory + history + user message — as Agno assembled it."""
+    msgs = getattr(response, "messages", None) or []
+    out = []
+    for m in msgs:
+        role = getattr(m, "role", None)
+        content = getattr(m, "content", None)
+        if content is None and hasattr(m, "get_content_string"):
+            try:
+                content = m.get_content_string()
+            except Exception:
+                content = ""
+        out.append({"role": role, "content": content or ""})
+    return out
+
+
+def extract_member_runs(response) -> list:
+    """Extract each team member's run so we can show what each agent said."""
+    member_responses = getattr(response, "member_responses", None) or []
+    out = []
+    for mr in member_responses:
+        out.append({
+            "agent_name": getattr(mr, "agent_name", None) or getattr(mr, "team_name", "member"),
+            "content": mr.content if isinstance(mr.content, str) else str(mr.content or ""),
+            "messages": [
+                {"role": getattr(m, "role", None), "content": getattr(m, "content", "") or ""}
+                for m in (getattr(mr, "messages", None) or [])
+            ],
+        })
+    return out
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # REQUEST MODELS
 # ═══════════════════════════════════════════════════════════════════════════
@@ -122,7 +155,6 @@ async def chat(body: ChatRequest):
         latency_ms = round((time.time() - start) * 1000, 1)
         raw_content = response.content if isinstance(response.content, str) else str(response.content)
 
-        # Try to parse structured decision from response
         decision = None
         try:
             cleaned = raw_content.strip()
@@ -144,6 +176,8 @@ async def chat(body: ChatRequest):
         return {
             "decision": decision,
             "raw_content": raw_content,
+            "prompt_sent": extract_prompt(response),
+            "member_runs": extract_member_runs(response),
             "session_id": session_id,
             "model": model_name,
             "latency_ms": latency_ms,

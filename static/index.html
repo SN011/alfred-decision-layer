@@ -300,8 +300,28 @@ function buildHood(data) {
   if (d.key_factors && d.key_factors.length) {
     parts += `<div class="flex flex-wrap gap-1 mt-2">${d.key_factors.map(f=>`<span class="text-xs mono bg-slate-800 px-2 py-0.5 rounded">${esc(f)}</span>`).join('')}</div>`;
   }
+  if (data.prompt_sent && data.prompt_sent.length) {
+    const promptHtml = data.prompt_sent.map(m => `
+      <div class="border-l-2 border-indigo-500/40 pl-2 mb-2">
+        <div class="text-xs mono text-indigo-300 uppercase tracking-wider">${esc(m.role || 'message')}</div>
+        <pre class="text-xs mono text-slate-400 whitespace-pre-wrap">${esc(m.content)}</pre>
+      </div>
+    `).join('');
+    parts += `<details class="mt-1"><summary class="text-xs text-slate-500">Exact Prompt Sent to Model <span class="text-slate-700">(${data.prompt_sent.length} msgs)</span></summary>
+      <div class="bg-[#0c0c14] rounded p-2 mt-1 max-h-96 overflow-y-auto">${promptHtml}</div></details>`;
+  }
+  if (data.member_runs && data.member_runs.length) {
+    const membersHtml = data.member_runs.map(mr => `
+      <div class="agent-pill rounded p-2 mb-2">
+        <div class="text-xs font-semibold text-indigo-400">${esc(mr.agent_name)}</div>
+        <pre class="text-xs mono text-slate-500 whitespace-pre-wrap mt-1">${esc(mr.content)}</pre>
+      </div>
+    `).join('');
+    parts += `<details class="mt-1"><summary class="text-xs text-slate-500">Member Agent Outputs <span class="text-slate-700">(${data.member_runs.length})</span></summary>
+      <div class="mt-1">${membersHtml}</div></details>`;
+  }
   if (data.raw_content) {
-    parts += `<details class="mt-1"><summary class="text-xs text-slate-500">Raw Model Output</summary>
+    parts += `<details class="mt-1"><summary class="text-xs text-slate-500">Raw Leader Output (parsed to decision above)</summary>
       <pre class="text-xs mono text-slate-500 bg-[#0c0c14] rounded p-2 mt-1 overflow-x-auto whitespace-pre-wrap max-h-48 overflow-y-auto">${esc(data.raw_content)}</pre></details>`;
   }
   return parts;

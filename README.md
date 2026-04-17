@@ -1,190 +1,207 @@
 # alfred_ Execution Decision Layer
 
-A prototype decision engine built with **Agno Team of Agents** that determines how an AI text-message assistant should handle proposed actions — whether to execute silently, notify after, confirm before, ask a clarifying question, or refuse.
+A prototype decision engine that determines how an AI text-message assistant should handle a proposed action: **execute silently**, **execute and notify**, **confirm before executing**, **ask a clarifying question**, or **refuse / escalate**.
 
-**Live URL:** [TODO: add after deploy]
-**Repo:** [TODO: add repo link]
+Built with an **Agno Team of Agents** (Risk Assessor + Conversation Analyst + Decision Leader), persistent memory, and xAI `grok-4-1-fast-reasoning`.
+
+- **Live URL:** https://alfred-decision-layer.onrender.com *(update after deploy)*
+- **Repo:** https://github.com/SN011/alfred-decision-layer
 
 ---
+
+## Why this design
+
+The challenge frames this as a **contextual conversation decision problem, not one-shot classification**. The canonical failure case is:
+
+> User asks alfred_ to draft a pricing email to Acme → alfred_ drafts it → user says "hold off until legal reviews pricing language" → minutes later, user says "Yep, send it."
+
+A one-shot classifier reads "Yep, send it" and fires. A good decision layer recognizes the pending legal condition was never resolved.
+
+So the system is built around two things the challenge explicitly cares about:
+
+1. **Context over the latest message** — conversation history is a first-class input, not a retrieval afterthought.
+2. **Judgment, not rules** — no regex, no keyword matching, no hand-coded risk scores. The reasoning is LLM-native.
 
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────┐
-│              Decision Team (Leader)                │
-│  Coordinates, synthesizes, makes final decision   │
-│  ┌──────────────┐    ┌────────────────────────┐  │
-│  │ Risk Assessor │    │ Conversation Analyst    │  │
-│  │ Evaluates     │    │ Reads history for       │  │
-│  │ action risk   │    │ conflicts & intent      │  │
-│  └──────────────┘    └────────────────────────┘  │
-│                                                    │
-│  Memory: learns user patterns across sessions      │
-│  Output: structured decision (Pydantic schema)     │
-└──────────────────────────────────────────────────┘
+                    ┌─────────────────────────────────────┐
+                    │          Decision Leader            │
+                    │  Delegates, synthesizes, decides    │
+                    │  Output: structured JSON decision   │
+                    └──────┬──────────────────────┬───────┘
+                           │                      │
+                   delegates to              delegates to
+                           │                      │
+             ┌─────────────▼─────────┐  ┌────────▼──────────────┐
+             │    Risk Assessor      │  │ Conversation Analyst  │
+             │  reversibility,       │  │ contradictions,       │
+             │  external impact,     │  │ unresolved conditions,│
+             │  scope, sensitivity   │  │ ambiguous references  │
+             └───────────────────────┘  └───────────────────────┘
+
+        Shared context: alfred_'s capabilities (what actions it can take
+        and what their real-world effects are — sending emails is
+        irreversible, reminders aren't, etc.)
+
+        Memory: SqliteDb with user_memories + agentic_memory +
+        add_history_to_context. The team learns user patterns over time.
 ```
 
-The team is an **Agno Team** — same framework and patterns used in the Project Heart supply chain agent. Three roles:
+## What signals the system uses, and why
 
-1. **Risk Assessor**: Evaluates the action itself — reversibility, external impact, scope, content sensitivity. Knows alfred_'s capabilities (what each action does and whether it's reversible).
+All signals come from the LLM reasoning over the context. No regex, no keyword matching. Each agent is prompted to look for specific dimensions:
 
-2. **Conversation Analyst**: Reads the full conversation history for contradictions, unresolved conditions, ambiguous references, and intent shifts. This is the agent that catches "Yep, send it" after "hold off until legal reviews."
+**Risk Assessor considers:**
+- **Reversibility** — can the action be undone? (Emails can't be unsent. Reminders can be deleted.)
+- **External reach** — does it touch people outside the user?
+- **Scope** — one item vs. bulk operations ("this email" vs. "all emails from last 6 months")
+- **Content sensitivity** — confidential data, pricing, legal language
+- **Missing parameters** — what's needed to execute but not in the request?
 
-3. **Decision Leader**: Delegates to both analysts, reads their findings, and makes the final call. Uses a structured output schema to return a consistent decision.
+Output: a risk paragraph ending with `LOW / MEDIUM / HIGH / CRITICAL`.
 
-## What Signals the System Uses
+**Conversation Analyst considers:**
+- **Contradictions** — "hold off" followed by "do it"
+- **Unresolved conditions** — "wait until legal reviews" — was that confirmed?
+- **Ambiguous references** — "cancel my meeting" when there are three
+- **Intent shifts** — "actually..." / "instead..."
 
-All signals come from the LLM reasoning over the context — **no regex, no keyword matching, no hardcoded rules.** The agents know alfred_'s capabilities (what's reversible, what affects externals) through their instructions, and reason about each scenario contextually.
+Output: an analysis paragraph ending with `CLEAR INTENT / AMBIGUOUS INTENT / CONFLICTING SIGNALS`.
 
-The Risk Assessor considers:
-- **Reversibility**: Can this be undone? (Emails can't be unsent. Reminders can be deleted.)
-- **External reach**: Does this affect people outside the user?
-- **Scope**: One item vs bulk operations
-- **Content sensitivity**: Confidential data, pricing info, legal language
-- **Missing parameters**: What would we need to execute this?
+**Decision Leader** reads both findings plus the full conversation, then returns structured JSON.
 
-The Conversation Analyst considers:
-- **Contradictions**: "Hold off" followed by "send it"
-- **Unresolved conditions**: "Wait for legal review" — did that happen?
-- **Ambiguous references**: "Cancel my meeting" when there are multiple
-- **Intent shifts**: "Actually..." or "instead..."
+## Code vs LLM split
 
-## Code vs LLM Responsibility
-
-### What the LLM decides (everything that matters)
-
-- Risk assessment of the action
-- Whether conversation history contains concerning patterns
-- The final decision (execute/notify/confirm/clarify/refuse)
-- The rationale in human terms
-- What to say to the user
-- Whether to escalate despite partial clarity
+### What the LLM decides (everything judgment-shaped)
+- Whether the action is reversible, external, sensitive
+- Whether the conversation has conflicting or unresolved signals
+- The final decision (`execute_silent` / `execute_notify` / `confirm` / `clarify` / `refuse`)
+- Confidence
+- The rationale and user-facing message
 
 ### What code does (plumbing only)
-
-- **Formats the scenario** into a structured message for the team
-- **Parses the structured output** from the team's response
-- **Handles failures** — timeout, malformed output, missing context → safe fallback
-- **Persists memory** via Agno's SqliteDb (the team remembers user patterns)
-- **Serves the API** via FastAPI
+- Format the incoming message and route to the team
+- Parse the leader's JSON output
+- Handle failures (timeout, malformed output, missing context) with a safe fallback
+- Persist conversation + memory via Agno's `SqliteDb`
+- Serve the API + UI
 
 ### Why this split
+An earlier draft computed deterministic "signals" — keyword matches, regex for scope, hardcoded reversibility scores. It mis-classified "call the dentist" as a bulk operation because "c**all**" contains "all". The LLM doesn't make that mistake. The model understands context; code doesn't. So code's job is formatting, parsing, persistence, and safe fallback — nothing more.
 
-The previous version tried to compute signals deterministically with regex and keyword matching. That was dumb. "Call the dentist" matched "all" because "c**all**" contains "all." The LLM doesn't make that mistake.
+## Prompt design
 
-The LLM understands context. It knows that "Yep, send it" after "hold off until legal reviews pricing language" is not a clear green light. No amount of keyword heuristics captures that. Let the model think.
+Each agent gets focused instructions with four pieces:
+1. **Role** — what they own ("evaluate risk" vs "analyze the conversation")
+2. **Shared capabilities context** — what alfred_ can do, what's reversible, what has external impact
+3. **What to look for** — specific dimensions to analyze
+4. **What NOT to do** — don't make the final decision, just analyze
 
-Code handles what code is good at: formatting, parsing, error handling, persistence. The model handles what models are good at: judgment, context, nuance.
+The Leader gets the full five-option decision framework, explicit boundaries (clarify when intent unresolved; confirm when intent resolved but risky; refuse when policy-violating), a default-safe principle ("when uncertain, escalate"), and the structured output format. See `decision_team.py`.
 
-## Prompt Design
+**The exact prompt the model receives is visible in the UI** on every decision — system message, history, memories, user input. Click "Exact Prompt Sent to Model" under any decision.
 
-Each agent has focused instructions that tell it:
-1. **What it's responsible for** (risk vs conversation analysis)
-2. **What alfred_ can do** (shared capabilities context — reversibility, external impact)
-3. **What to look for** (specific things to analyze)
-4. **What NOT to do** (don't make the final decision — that's the leader's job)
+## Failure handling
 
-The leader's instructions define:
-1. **The five decisions** with clear definitions and examples
-2. **Decision boundaries** — when to clarify vs confirm vs refuse
-3. **The default-safe principle** — when uncertain, escalate
-4. **The process** — delegate to both analysts, read their findings, synthesize
+| Failure | Detected by | Safe default |
+|---|---|---|
+| **LLM timeout** | Exception → `get_fallback_decision` | `confirm` — never silently execute |
+| **Malformed output** | `JSONDecodeError` in parser | `confirm` — never silently execute |
+| **Missing critical context** | Natural LLM response (e.g. "do the thing") | `clarify` — ask the user |
 
-The scenario is formatted as a structured message with sections: Proposed Action, Latest User Message, Conversation History, User Preferences. Clean and readable for the model.
+**The principle:** no failure path results in silent execution of an irreversible action. Every failure either asks the user or escalates.
 
-## Agno Memory
+All three failure paths are wired to buttons in the UI so they're demonstrable in one click.
 
-The team uses Agno's built-in memory (`enable_user_memories=True`, `enable_agentic_memory=True`):
-- **User memories**: The team remembers facts about users across sessions
-- **Agentic memory**: The team learns from past decisions
-- **Chat history**: 5 previous runs are included in context
+## Memory
 
-Over time, the team learns patterns: "This user always wants external emails confirmed," "This user is fine with calendar changes being automatic." The decision quality improves with usage.
+Uses Agno's `SqliteDb` with:
+- `add_history_to_context=True` + `num_history_runs=5` — the last 5 turns come along in every prompt
+- `enable_user_memories=True` — the team extracts and stores facts about the user
+- `enable_agentic_memory=True` — the team can decide when to update memories based on the run
 
-## Failure Handling
+Over time, the team learns patterns like "this user always wants external emails confirmed" and adjusts. The UI has a live **Memories** panel so you can see memories appear as you chat.
 
-| Failure | What happens | Safe default |
-|---------|-------------|--------------|
-| **LLM timeout** | Team can't deliberate | CONFIRM — let the human decide |
-| **Malformed output** | Can't parse structured decision | CONFIRM — let the human decide |
-| **Missing context** | Action is vague ("do the thing") | Runs through team naturally → agents ask to CLARIFY |
+## Scenarios (8 preloaded)
 
-**The principle**: no failure ever results in silent execution. If something goes wrong, we either ask the user to confirm or ask them to clarify. Irreversible actions should never happen by default.
+| # | Name | Difficulty | Expected |
+|---|---|---|---|
+| 1 | Set a reminder | easy | execute_silent |
+| 2 | Check tomorrow's calendar | easy | execute_silent |
+| 3 | Quick reply to teammate | easy | execute_notify |
+| 4 | Cancel which meeting? | ambiguous | clarify |
+| 5 | Reschedule with external client | ambiguous | confirm |
+| 6 | Send after "hold off" (the canonical example) | ambiguous | confirm |
+| 7 | Delete 6 months of emails | risky | refuse |
+| 8 | Forward board notes to press | risky | refuse |
 
-All three failure cases are demonstrable in the UI.
+Scenario 6 is the one from the challenge doc. The Conversation Analyst should catch that "hold off until legal reviews" is an unresolved condition — "Yep, send it" doesn't confirm legal finished reviewing.
 
-## Scenarios
+## How this evolves as alfred_ gains riskier tools
 
-| # | Name | Difficulty | Expected | Why |
-|---|------|-----------|----------|-----|
-| 1 | Set a reminder | Easy | Execute silent | Low risk, clear intent, fully reversible, no external impact |
-| 2 | Check calendar | Easy | Execute silent | Read-only, zero risk, zero side effects |
-| 3 | Cancel which meeting? | Ambiguous | Clarify | 3 meetings this afternoon — entity unresolved |
-| 4 | Send email after "hold off" | Ambiguous | Confirm | Conversation history has conflicting signals |
-| 5 | Delete 6 months of emails | Risky | Refuse | Irreversible bulk destruction |
-| 6 | Forward board notes to press | Risky | Refuse | Confidential data to journalist |
-| 7 | Quick reply to teammate | Easy | Execute & notify | Low risk internal, but user should know it happened |
-| 8 | Reschedule with external client | Ambiguous | Confirm | Affects someone else's calendar |
+- **More agents, not more rules.** Add a Policy Enforcer (GDPR, HIPAA, org policy) and a Trust Scorer that adjusts thresholds based on each user's correction history. The team pattern scales; a rule engine doesn't.
+- **Action-specific sub-teams.** Financial transactions, bulk data operations, external communications get routed to specialist sub-teams with extra scrutiny and their own risk models.
+- **Standing permissions.** "Always approve internal calendar moves" — user-granted blanket trust, reducing unnecessary confirmation friction.
+- **Risk-adjusted latency budgets.** Calendar checks should be instant; sending an external email can afford 2 seconds of deliberation.
 
-Scenario 4 is the example from the challenge. The Conversation Analyst should catch that "hold off until legal reviews pricing language" creates a pending condition, and that the subsequent "Yep, send it" doesn't confirm that condition was met.
+## What I'd build next (6-month roadmap if I owned this)
 
-## How This System Evolves
+**Month 1–2 — Foundation**
+- User feedback loop: in-UI "you didn't need to ask" / "you should have asked" signals that feed back into per-user calibration
+- Full audit log of every decision with the exact prompt, analyst outputs, and final decision (for trust and debugging)
+- Latency budgets per action type
 
-### As alfred_ gains riskier tools
-
-- **More specialized agents**: Add a Policy Enforcer agent that checks organizational rules (GDPR, HIPAA, company policy). Add a User Trust Scorer that adjusts thresholds based on the user's correction history.
-- **Action-specific sub-teams**: High-risk actions (financial transactions, data deletion) get routed to a specialized sub-team with extra scrutiny.
-- **Standing permissions**: Users can grant alfred_ blanket approval for certain action patterns ("always approve internal calendar changes"), reducing unnecessary confirmations.
-
-### What I'd build next (6-month roadmap)
-
-**Month 1-2: Foundation**
-- User feedback loop: "You didn't need to ask me that" / "You should have asked" signals
-- Per-user threshold calibration based on correction history
-- Audit log of every decision with full context (for trust and debugging)
-- Latency budgets per action type (calendar checks should be instant; email sends can wait 2s)
-
-**Month 3-4: Learning**
-- Anomaly detection: user who never sends bulk emails suddenly wants to → escalate regardless
-- Multi-step action chains: evaluate compound actions together
-- A/B framework for testing decision thresholds
+**Month 3–4 — Learning**
+- Anomaly detection on action patterns (user who never sends bulk emails suddenly does → escalate)
+- Multi-step action chains evaluated together, not turn-by-turn
+- A/B framework for decision thresholds
 - Organization-level policy engine
 
-**Month 5-6: Scale**
-- Fine-tuned decision model trained on real user feedback
-- Delegation protocols with standing permissions
-- Compliance integration (GDPR, HIPAA constraints as team context)
+**Month 5–6 — Scale**
+- Fine-tuned decision model on real user feedback — faster, cheaper, more reliable than a general LLM for this task
+- Compliance integration (GDPR, HIPAA) injected as team context
 - Real-time risk dashboard for alfred_ operators
+- Delegation protocols with standing permissions
 
-## What I Chose Not to Build
+## What I chose not to build
 
-- **Real action execution**: The prototype decides but doesn't send emails or cancel meetings
-- **Streaming**: Each evaluation is request/response; streaming would improve UX but isn't the core problem
-- **User authentication**: Prototype is open; production would personalize per-user
-- **Fine-tuned model**: Using a general-purpose LLM with prompt engineering; a fine-tuned model would be faster and more reliable
+- **Real action execution.** The prototype decides but doesn't actually send emails or edit calendars. The decision layer is the product.
+- **Streaming.** Request/response is fine at this stage; streaming is a polish item.
+- **Per-user auth.** Everyone is `demo_user`. Production would personalize and scope memory per-user.
+- **Fine-tuned model.** Prompt-engineered general LLM is faster to build; a fine-tune is a later optimization.
 
-## Running Locally
+## Running locally
 
 ```bash
-cd alfred_decision_layer
+git clone https://github.com/SN011/alfred-decision-layer
+cd alfred-decision-layer
 
-# Install deps (or use existing venv)
 pip install -r requirements.txt
 
-# Set an LLM API key (any one)
-export GROQ_API_KEY=your-key     # Fast + free tier
-# OR export XAI_API_KEY=your-key
-# OR export OPENAI_API_KEY=your-key
+cp .env.example .env
+# Edit .env and add ONE of: XAI_API_KEY, OPENAI_API_KEY, or GROQ_API_KEY
 
 python server.py
 # → http://localhost:8080
 ```
 
-## Tech Stack
+## Deploy to Render (one-click)
 
-- **Agents**: Agno Team of Agents (same framework as Project Heart supply chain agent)
-- **Backend**: FastAPI — same patterns as `python_api/supply_chain_agent.py`
-- **LLM**: Groq / xAI / OpenAI (auto-detects from env)
-- **Memory**: Agno SqliteDb — user memories + agentic memory
-- **Frontend**: Vanilla HTML + Tailwind CSS (no build step)
-- **Deploy**: Docker → any container platform
+This repo includes a `render.yaml`. On [render.com](https://render.com):
+
+1. New → Blueprint → connect this repo
+2. Render reads `render.yaml` and creates the web service
+3. Set the `XAI_API_KEY` (or OpenAI / Groq) env var in the Render dashboard
+4. Deploy
+
+See [RENDER_DEPLOY.md](./RENDER_DEPLOY.md) for the step-by-step.
+
+## Tech stack
+
+- **Agents:** Agno Team of Agents
+- **Backend:** FastAPI
+- **LLM:** xAI `grok-4-1-fast-reasoning` (falls back to OpenAI or Groq if xAI key not set)
+- **Memory:** Agno `SqliteDb` (user memories + agentic memory + chat history)
+- **Frontend:** Vanilla HTML + Tailwind (no build step)
+- **Deploy:** Render (Docker optional)
