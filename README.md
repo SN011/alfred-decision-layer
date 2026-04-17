@@ -4,7 +4,7 @@ A prototype decision engine that determines how an AI text-message assistant sho
 
 The system is implemented as a multi-agent team built on the [Agno](https://docs.agno.com/) framework, backed by persistent memory and running `xai/grok-4-1-fast-reasoning` as the reasoning model.
 
-- **Live URL:** [https://alfred-decision-layer.onrender.com *(update after deploy)*](https://alfred-decision-layer-21y9.onrender.com/)
+- **Live URL:** [https://alfred-decision-layer.onrender.com](https://alfred-decision-layer-21y9.onrender.com/)
 - **Repo:** https://github.com/SN011/alfred-decision-layer
 
 ---
