@@ -279,49 +279,120 @@ async def play_scenario(body: dict):
 
 @app.post("/api/simulate-failure")
 async def simulate_failure(body: FailureRequest):
+    """Demonstrate how the Decision Layer handles failure modes.
+
+    Returns structured diagnostic data so the UI can render each as a
+    labelled pipeline view: INPUT → DETECTION → FALLBACK → USER-FACING."""
+
     if body.failure_type == "timeout":
+        malformed_raw = ""
+        detection_error = "asyncio.TimeoutError after 30000ms — no response from model"
+        fallback = get_fallback_decision("LLM request timed out after 30s")
         return {
-            "decision": get_fallback_decision("LLM request timed out after 30 seconds"),
-            "raw_content": "[TIMEOUT — no response received]",
+            "failure_type": "timeout",
+            "kind": "pipeline_failure",
+            "simulated_input": "Send the quarterly revenue deck to board@acme.com",
+            "detection": {
+                "where": "server.py /chat handler, team.run() call",
+                "signal": "Exception raised — request exceeded deadline",
+                "error": detection_error,
+            },
+            "code_path": "except Exception → get_fallback_decision(error)",
+            "principle": "When we can't get a decision, we never silently execute. We always fall back to 'confirm' so the human stays in control.",
+            "decision": fallback,
+            "raw_content": malformed_raw,
             "latency_ms": 30000,
             "is_fallback": True,
-            "failure_type": "timeout",
         }
-    elif body.failure_type == "malformed":
+
+    if body.failure_type == "malformed":
+        broken_json = '{"decision": "sure_go_ahead", confidence: very_high, rationale: "missing quotes and invalid enum"}'
+        fallback = get_fallback_decision("JSONDecodeError while parsing model output")
         return {
-            "decision": get_fallback_decision("Model returned invalid JSON"),
-            "raw_content": '{"decision": "sure_go_ahead", confidence: very_high, rationale: missing quotes}',
-            "latency_ms": 800,
+            "failure_type": "malformed",
+            "kind": "pipeline_failure",
+            "simulated_input": "Cancel my 2pm meeting with Sarah",
+            "detection": {
+                "where": "server.py /chat handler, json.loads(response.content)",
+                "signal": "json.JSONDecodeError — unquoted keys, invalid enum value",
+                "error": "Expecting property name enclosed in double quotes: line 1 column 36 (char 35)",
+            },
+            "code_path": "except JSONDecodeError → get_fallback_decision(error)",
+            "principle": "A model that returns broken JSON is a model whose reasoning we can't trust. Default to confirm.",
+            "decision": fallback,
+            "raw_content": broken_json,
+            "latency_ms": 840,
             "is_fallback": True,
-            "failure_type": "malformed_output",
         }
-    elif body.failure_type == "missing_context":
+
+    if body.failure_type == "missing_context":
+        simulated = "Do the thing"
         if team:
             try:
-                response = team.run("Do the thing", stream=False, session_id=str(uuid.uuid4()), user_id="demo_user")
+                start = time.time()
+                response = team.run(simulated, stream=False, session_id=str(uuid.uuid4()), user_id="demo_user")
+                latency_ms = round((time.time() - start) * 1000, 1)
                 raw = response.content if isinstance(response.content, str) else str(response.content)
                 try:
-                    decision = json.loads(raw.strip())
-                except:
-                    decision = {"decision": "clarify", "rationale": raw, "user_facing_message": raw}
+                    cleaned = raw.strip()
+                    if cleaned.startswith("```"):
+                        cleaned = cleaned.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+                    decision = json.loads(cleaned)
+                except Exception:
+                    decision = {
+                        "decision": "clarify",
+                        "rationale": raw,
+                        "user_facing_message": raw,
+                        "confidence": 0.5,
+                    }
                 return {
+                    "failure_type": "missing_context",
+                    "kind": "happy_path_demo",
+                    "simulated_input": simulated,
+                    "detection": {
+                        "where": "Conversation Analyst (agent reasoning, not code)",
+                        "signal": "Agent identifies no parseable action, no entities, no history",
+                        "error": None,
+                    },
+                    "code_path": "team.run() → Conversation Analyst flags ambiguous intent → Leader returns clarify",
+                    "principle": "Missing context isn't a bug — the team recognizes it and asks. No fallback was needed; the system handled it on its own.",
                     "decision": decision,
                     "raw_content": raw,
-                    "latency_ms": 0,
+                    "latency_ms": latency_ms,
                     "is_fallback": False,
-                    "failure_type": "missing_context",
                 }
             except Exception as e:
-                pass
-        fallback = get_fallback_decision("No recognizable action or context")
+                fallback = get_fallback_decision(f"Team run failed: {e}")
+                return {
+                    "failure_type": "missing_context",
+                    "kind": "pipeline_failure",
+                    "simulated_input": simulated,
+                    "detection": {
+                        "where": "team.run()",
+                        "signal": "Exception during team execution",
+                        "error": str(e),
+                    },
+                    "code_path": "except Exception → get_fallback_decision(error)",
+                    "principle": "Even if the team fails on ambiguous input, we still ask the user rather than guessing.",
+                    "decision": fallback,
+                    "raw_content": "",
+                    "latency_ms": 0,
+                    "is_fallback": True,
+                }
+        fallback = get_fallback_decision("Team not initialized")
         fallback["decision"] = "clarify"
         fallback["user_facing_message"] = "I'm not sure what you'd like me to do. Could you give me more details?"
         return {
+            "failure_type": "missing_context",
+            "kind": "pipeline_failure",
+            "simulated_input": simulated,
+            "detection": {"where": "startup", "signal": "Team unavailable", "error": "Team was not initialized — API key missing?"},
+            "code_path": "fallback",
+            "principle": "Even with no team, we ask rather than act.",
             "decision": fallback,
             "raw_content": "",
             "latency_ms": 0,
             "is_fallback": True,
-            "failure_type": "missing_context",
         }
 
     return JSONResponse(status_code=400, content={"error": f"Unknown: {body.failure_type}"})
